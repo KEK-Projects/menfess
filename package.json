@@ -1,0 +1,13 @@
+{
+  "name": "tg-menfess-serverless",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test scripts/test-menfess.mjs"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0",
+    "@upstash/redis": "^1.34.0"
+  }
+}
