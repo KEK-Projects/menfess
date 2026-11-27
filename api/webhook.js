@@ -2,6 +2,7 @@ import {
   claimEventOnce,
   consumeDailyQuota,
   refundDailyQuota,
+  runPeriodicDbSelfHeal,
   getActiveCategories,
   getSession,
   setSession,
@@ -13,6 +14,7 @@ import {
 import { isValidTelegramSecret } from "../src/lib/security.js";
 import {
   tgCall,
+  safeDeleteMessage,
   extractMediaPayload,
   publishToChannel,
 } from "../src/lib/telegram.js";
@@ -21,6 +23,12 @@ const CHANNEL_ID = process.env.MENFESS_CHANNEL_ID;
 const BOT_USERNAME = process.env.BOT_USERNAME || "";
 const DAILY_QUOTA = Number(process.env.DAILY_QUOTA || 3);
 const WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET || "";
+const KEEP_DAYS = Number(process.env.DB_KEEP_DAYS || 10);
+const PURGE_STATUSES = (process.env.DB_PURGE_STATUSES || "published,rejected")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+const HEAL_LOCK_SECONDS = Number(process.env.DB_HEAL_LOCK_SECONDS || 3600);
 
 function mainMenuMarkup() {
   return {
@@ -72,60 +80,59 @@ async function handleCallback(cq) {
   if (!isUnique) return;
 
   if (data === "mf:cancel") {
+    const prevSess = await getSession(userId);
     await Promise.all([
       clearSession(userId),
-      msgId
-        ? tgCall("editMessageText", {
-            chat_id: chatId,
-            message_id: msgId,
-            text: "Pengiriman menfess dibatalkan.",
-            parse_mode: "HTML",
-            reply_markup: mainMenuMarkup(),
-          }).catch(() => null)
-        : Promise.resolve(),
+      safeDeleteMessage(chatId, msgId),
+      safeDeleteMessage(chatId, prevSess?.pm),
     ]);
+    await tgCall("sendMessage", {
+      chat_id: chatId,
+      text: "Pengiriman menfess dibatalkan.",
+      parse_mode: "HTML",
+      reply_markup: mainMenuMarkup(),
+    });
     return;
   }
 
   if (data === "mf:open") {
-    await setSession(userId, { s: "PICK_KIND" });
-    const text =
-      "<b>Pilih Jenis Menfess</b>\n\n" +
-      "• <b>Menfess Teks</b>: wajib isi teks.\n" +
-      "• <b>Menfess Media</b>: foto/video/dokumen/GIF, teks/caption boleh kosong.";
+    const sent = await tgCall("sendMessage", {
+      chat_id: chatId,
+      text:
+        "<b>Pilih Jenis Menfess</b>\n\n" +
+        "• <b>Menfess Teks</b>: wajib isi teks.\n" +
+        "• <b>Menfess Media</b>: foto/video/dokumen/GIF, teks/caption boleh kosong.",
+      parse_mode: "HTML",
+      reply_markup: kindChoiceMarkup(),
+    });
 
-    if (msgId) {
-      await tgCall("editMessageText", {
-        chat_id: chatId,
-        message_id: msgId,
-        text,
-        parse_mode: "HTML",
-        reply_markup: kindChoiceMarkup(),
-      });
-    }
+    await Promise.all([
+      setSession(userId, { s: "PICK_KIND", pm: sent?.message_id }),
+      safeDeleteMessage(chatId, msgId),
+    ]);
     return;
   }
 
   if (data === "mf:kind:text" || data === "mf:kind:media") {
     const kind = data === "mf:kind:text" ? "text" : "media";
-    await setSession(userId, { s: "WAIT_INPUT", k: kind });
-
     const promptHtml =
       kind === "text"
         ? "<b>Mode: Menfess Teks</b>\n\nSilakan kirimkan isi pesan teks Anda (maksimal 3500 karakter). Teks tidak boleh kosong."
         : "<b>Mode: Menfess Media</b>\n\nSilakan kirimkan foto, video, GIF, atau dokumen. Caption/teks bersifat <b>opsional</b> (boleh dikosongkan).";
 
-    if (msgId) {
-      await tgCall("editMessageText", {
-        chat_id: chatId,
-        message_id: msgId,
-        text: promptHtml,
-        parse_mode: "HTML",
-        reply_markup: {
-          inline_keyboard: [[{ text: "❌ Batal", callback_data: "mf:cancel" }]],
-        },
-      });
-    }
+    const sent = await tgCall("sendMessage", {
+      chat_id: chatId,
+      text: promptHtml,
+      parse_mode: "HTML",
+      reply_markup: {
+        inline_keyboard: [[{ text: "❌ Batal", callback_data: "mf:cancel" }]],
+      },
+    });
+
+    await Promise.all([
+      setSession(userId, { s: "WAIT_INPUT", k: kind, pm: sent?.message_id }),
+      safeDeleteMessage(chatId, msgId),
+    ]);
     return;
   }
 
@@ -138,27 +145,37 @@ async function handleCallback(cq) {
 
     const chosenCat = categories.find((c) => c.slug === slug);
     if (!sess || sess.s !== "PICK_CAT" || !chosenCat || !sess.m) {
-      await tgCall("sendMessage", {
-        chat_id: chatId,
-        text: "Sesi sudah berakhir atau tidak valid. Mulai lagi dengan /start.",
-        parse_mode: "HTML",
-      });
+      await Promise.all([
+        safeDeleteMessage(chatId, msgId),
+        tgCall("sendMessage", {
+          chat_id: chatId,
+          text: "Sesi sudah berakhir atau tidak valid. Mulai lagi dengan /start.",
+          parse_mode: "HTML",
+        }),
+      ]);
       return;
     }
 
     if (sess.k === "text" && (!sess.m.t || !sess.m.t.trim())) {
-      await setSession(userId, { s: "WAIT_INPUT", k: "text" });
-      await tgCall("sendMessage", {
-        chat_id: chatId,
-        text: "Menfess teks tidak boleh kosong. Silakan kirim teks Anda.",
-        parse_mode: "HTML",
-      });
+      await Promise.all([
+        setSession(userId, { s: "WAIT_INPUT", k: "text", pm: sess.pm }),
+        safeDeleteMessage(chatId, msgId),
+        tgCall("sendMessage", {
+          chat_id: chatId,
+          text: "Menfess teks tidak boleh kosong. Silakan kirim teks Anda.",
+          parse_mode: "HTML",
+        }),
+      ]);
       return;
     }
 
     const quota = await consumeDailyQuota(userId, DAILY_QUOTA);
     if (!quota.allowed) {
-      await clearSession(userId);
+      await Promise.all([
+        clearSession(userId),
+        safeDeleteMessage(chatId, msgId),
+        safeDeleteMessage(chatId, sess.pm),
+      ]);
       await tgCall("sendMessage", {
         chat_id: chatId,
         text: `Kuota menfess harian Anda sudah habis (<b>${quota.used}/${quota.limit}</b>). Silakan coba lagi besok.`,
@@ -212,6 +229,8 @@ async function handleCallback(cq) {
           p_status: "published",
         }),
         clearSession(userId),
+        safeDeleteMessage(chatId, msgId),
+        safeDeleteMessage(chatId, sess.pm),
       ]);
 
       const safeCat = escapeHtml(chosenCat.label);
@@ -230,6 +249,8 @@ async function handleCallback(cq) {
       await Promise.all([
         refundDailyQuota(userId).catch(() => null),
         clearSession(userId).catch(() => null),
+        safeDeleteMessage(chatId, msgId),
+        safeDeleteMessage(chatId, sess.pm),
       ]);
 
       await tgCall("sendMessage", {
@@ -250,7 +271,12 @@ async function handleMessage(msg) {
   const rawText = typeof msg.text === "string" ? msg.text.trim() : "";
 
   if (rawText === "/start") {
-    await clearSession(userId);
+    const prevSess = await getSession(userId);
+    await Promise.all([
+      clearSession(userId),
+      safeDeleteMessage(chatId, prevSess?.pm),
+    ]);
+
     const welcomeHtml =
       "<b>Selamat Datang di Bot Menfess</b>\n\n" +
       "Kirimkan pesan anonim ke channel tanpa membuka identitas Anda. Diskusi bisa langsung dilakukan lewat kolom komentar di channel.\n\n" +
@@ -266,11 +292,16 @@ async function handleMessage(msg) {
   }
 
   if (rawText === "/cancel") {
-    await clearSession(userId);
+    const prevSess = await getSession(userId);
+    await Promise.all([
+      clearSession(userId),
+      safeDeleteMessage(chatId, prevSess?.pm),
+    ]);
     await tgCall("sendMessage", {
       chat_id: chatId,
       text: "Aksi dibatalkan. Ketik /start untuk membuka menu.",
       parse_mode: "HTML",
+      reply_markup: mainMenuMarkup(),
     });
     return;
   }
@@ -293,18 +324,21 @@ async function handleMessage(msg) {
     const cleanText = truncateText(rawText, 3500);
     const [categories] = await Promise.all([
       getActiveCategories(),
-      setSession(userId, {
-        s: "PICK_CAT",
-        k: "text",
-        m: { t: cleanText },
-      }),
+      safeDeleteMessage(chatId, sess.pm),
     ]);
 
-    await tgCall("sendMessage", {
+    const sent = await tgCall("sendMessage", {
       chat_id: chatId,
       text: "<b>Pilih Kategori Menfess</b>:",
       parse_mode: "HTML",
       reply_markup: categoryMarkup(categories),
+    });
+
+    await setSession(userId, {
+      s: "PICK_CAT",
+      k: "text",
+      pm: sent?.message_id,
+      m: { t: cleanText },
     });
     return;
   }
@@ -323,22 +357,25 @@ async function handleMessage(msg) {
     const optionalCaption = truncateText(media.caption.trim(), 850);
     const [categories] = await Promise.all([
       getActiveCategories(),
-      setSession(userId, {
-        s: "PICK_CAT",
-        k: "media",
-        m: {
-          mt: media.mediaType,
-          f: media.fileId,
-          x: optionalCaption,
-        },
-      }),
+      safeDeleteMessage(chatId, sess.pm),
     ]);
 
-    await tgCall("sendMessage", {
+    const sent = await tgCall("sendMessage", {
       chat_id: chatId,
       text: "<b>Pilih Kategori Menfess</b>:",
       parse_mode: "HTML",
       reply_markup: categoryMarkup(categories),
+    });
+
+    await setSession(userId, {
+      s: "PICK_CAT",
+      k: "media",
+      pm: sent?.message_id,
+      m: {
+        mt: media.mediaType,
+        f: media.fileId,
+        x: optionalCaption,
+      },
     });
   }
 }
@@ -363,11 +400,14 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, dedup: true });
     }
 
-    if (update.callback_query) {
-      await handleCallback(update.callback_query);
-    } else if (update.message) {
-      await handleMessage(update.message);
-    }
+    await Promise.allSettled([
+      update.callback_query
+        ? handleCallback(update.callback_query)
+        : update.message
+          ? handleMessage(update.message)
+          : Promise.resolve(),
+      runPeriodicDbSelfHeal(KEEP_DAYS, PURGE_STATUSES, HEAL_LOCK_SECONDS),
+    ]);
 
     return res.status(200).json({ ok: true });
   } catch (err) {
