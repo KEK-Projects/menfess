@@ -1,8 +1,14 @@
-import { escapeHtml, truncateText } from "./infra.js";
+import crypto from "node:crypto";
+import { escapeHtml, truncateText, claimEventOnce } from "./infra.js";
 
 const BOT_API_BASE = "https://api.telegram.org";
+const DEFAULT_ADMIN_LOG_CHANNEL = "-1001778725181";
 
-export async function tgCall(method, payload, botToken = process.env.TELEGRAM_BOT_TOKEN) {
+export async function tgCall(
+  method,
+  payload,
+  botToken = process.env.TELEGRAM_BOT_TOKEN
+) {
   if (!botToken) {
     throw new Error("TELEGRAM_BOT_TOKEN is not configured");
   }
@@ -30,6 +36,90 @@ export async function tgCall(method, payload, botToken = process.env.TELEGRAM_BO
   return json.result;
 }
 
+export async function safeDeleteMessage(chatId, messageId) {
+  if (!chatId || !messageId) return false;
+  try {
+    await tgCall("deleteMessage", {
+      chat_id: chatId,
+      message_id: messageId,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function reportSystemError(
+  context,
+  err,
+  extraMeta = "",
+  deps = {}
+) {
+  const tgCaller = deps.tgCall || tgCall;
+  const claimOnce = deps.claimEventOnce || claimEventOnce;
+  const logChannelId =
+    deps.logChannelId ||
+    process.env.ADMIN_LOG_CHANNEL_ID ||
+    DEFAULT_ADMIN_LOG_CHANNEL;
+
+  const rawMsg =
+    err instanceof Error
+      ? err.stack || err.message
+      : typeof err === "string"
+        ? err
+        : JSON.stringify(err ?? "Unknown error");
+
+  const cleanContext = truncateText(String(context || "system"), 120);
+  const cleanMsg = truncateText(String(rawMsg || "Unknown error"), 1500);
+  const cleanMeta = truncateText(String(extraMeta || ""), 400);
+
+  const hash = crypto
+    .createHash("sha256")
+    .update(`${cleanContext}|${cleanMsg}`)
+    .digest("hex")
+    .slice(0, 12);
+
+  try {
+    const canSend = await claimOnce(`errlog:mfs:${hash}`, 60).catch(
+      () => true
+    );
+    if (!canSend) return false;
+
+    const timeWib =
+      new Date(Date.now() + 7 * 3600 * 1000)
+        .toISOString()
+        .replace("T", " ")
+        .slice(0, 19) + " WIB";
+
+    const lines = [
+      `🚨 <b>[MFS]</b> <b>System Error Alert</b>`,
+      `<b>Context:</b> <code>${escapeHtml(cleanContext)}</code>`,
+      `<b>Time:</b> <code>${escapeHtml(timeWib)}</code>`,
+    ];
+
+    if (cleanMeta) {
+      lines.push(`<b>Meta:</b> <code>${escapeHtml(cleanMeta)}</code>`);
+    }
+
+    lines.push(`<b>Error:</b>\n<pre>${escapeHtml(cleanMsg)}</pre>`);
+
+    await tgCaller("sendMessage", {
+      chat_id: logChannelId,
+      text: lines.join("\n"),
+      parse_mode: "HTML",
+      disable_web_page_preview: true,
+    });
+
+    return true;
+  } catch (logErr) {
+    console.error(
+      "[MFS] Failed to send error log to admin channel:",
+      logErr?.message || logErr
+    );
+    return false;
+  }
+}
+
 export function extractMediaPayload(msg) {
   if (!msg || typeof msg !== "object") return null;
 
@@ -46,7 +136,11 @@ export function extractMediaPayload(msg) {
     }
   }
 
-  if (msg.video && typeof msg.video.file_id === "string" && msg.video.file_id.length > 0) {
+  if (
+    msg.video &&
+    typeof msg.video.file_id === "string" &&
+    msg.video.file_id.length > 0
+  ) {
     return {
       mediaType: "video",
       fileId: msg.video.file_id,
@@ -90,10 +184,11 @@ export function buildChannelHtml({
 }) {
   const safeCode = Math.max(0, Number(publicCode) || 0);
   const safeCat = escapeHtml(categoryLabel || "Menfess");
-  const cleanBot = typeof botUsername === "string" ? botUsername.replace(/^@/, "").trim() : "";
+  const cleanBot =
+    typeof botUsername === "string" ? botUsername.replace(/^@/, "").trim() : "";
   const safeBot = escapeHtml(cleanBot);
   const footer = safeBot
-    ? `\n\n<i>Kirim lewat @${safeBot} · Komentar di bawah</i>`
+    ? `\n\n<i>Kirim menfess lewat @${safeBot} · Komentar di bawah</i>`
     : `\n\n<i>Komentar di bawah</i>`;
 
   if (kind === "text") {
@@ -101,10 +196,11 @@ export function buildChannelHtml({
     return `<b>#${safeCat}</b> · <b>#${safeCode}</b>\n\n${body}${footer}`;
   }
 
-  // Media: caption opsional (boleh kosong)
   const trimmedCap = typeof textBody === "string" ? textBody.trim() : "";
   const capBlock =
-    trimmedCap.length > 0 ? `\n\n${escapeHtml(truncateText(trimmedCap, 850))}` : "";
+    trimmedCap.length > 0
+      ? `\n\n${escapeHtml(truncateText(trimmedCap, 850))}`
+      : "";
 
   return `<b>#${safeCat}</b> · <b>#${safeCode}</b>${capBlock}${footer}`;
 }
