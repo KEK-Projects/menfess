@@ -950,6 +950,39 @@ async function handleMessage(msg) {
   }
 }
 
+  if (rawText === "/fileid" || rawText.startsWith("/fileid ")) {
+    if (!ADMIN_IDS.has(userId)) {
+      await tgCall("sendMessage", {
+        chat_id: chatId,
+        text: "Perintah ini khusus admin.",
+        parse_mode: "HTML",
+      });
+      return;
+    }
+
+    const targetMsg = msg.reply_to_message || msg;
+    const media = extractMediaPayload(targetMsg);
+
+    if (!media || !media.fileId) {
+      await tgCall("sendMessage", {
+        chat_id: chatId,
+        text: "Kirim foto/media dengan caption <code>/fileid</code> atau balas (<i>reply</i>) pesan foto menggunakan <code>/fileid</code>.",
+        parse_mode: "HTML",
+      });
+      return;
+    }
+
+    await tgCall("sendMessage", {
+      chat_id: chatId,
+      text:
+        `<b>📎 Media Info (${escapeHtml(media.mediaType)})</b>\n\n` +
+        `<code>${escapeHtml(media.fileId)}</code>`,
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+
 export default async function handler(req, res) {
   if (req.method !== "POST") {
     return res.status(200).json({ ok: true });
