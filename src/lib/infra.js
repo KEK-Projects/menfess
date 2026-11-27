@@ -18,6 +18,8 @@ const DEFAULT_CATEGORIES = [
   { slug: "random", label: "Random" },
 ];
 
+const DEFAULT_VIP_QUOTA = Number(process.env.VIP_DAILY_QUOTA || 20);
+
 export function escapeHtml(str) {
   if (typeof str !== "string") return "";
   return str
@@ -100,6 +102,76 @@ export async function consumeDailyQuota(userId, dailyLimit = 5) {
 export async function refundDailyQuota(userId) {
   const key = quotaKeyForTodayWib(userId);
   await redis.eval(QUOTA_REFUND_LUA, [key], []);
+}
+
+export function getEffectiveDailyQuota(
+  isVip,
+  baseQuota = 5,
+  vipQuota = DEFAULT_VIP_QUOTA
+) {
+  const safeBase = Math.max(1, Number(baseQuota) || 5);
+  const safeVip = Math.max(safeBase, Number(vipQuota) || safeBase);
+  return isVip ? safeVip : safeBase;
+}
+
+export async function getUserVipInfo(userId, deps = {}) {
+  const redisClient = deps.redis || redis;
+  if (!userId) {
+    return { isVip: false, expiresAt: null, remainingText: "" };
+  }
+
+  const raw = await redisClient.get(`vip:${userId}`);
+  if (!raw) {
+    return { isVip: false, expiresAt: null, remainingText: "" };
+  }
+
+  let expiresAt = null;
+  if (raw && typeof raw === "object" && raw.expiresAt) {
+    expiresAt = String(raw.expiresAt);
+  } else if (typeof raw === "string") {
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === "object" && parsed.expiresAt) {
+        expiresAt = String(parsed.expiresAt);
+      }
+    } catch {
+      expiresAt = null;
+    }
+  }
+
+  let remainingText = "";
+  if (expiresAt) {
+    const diffMs = Date.parse(expiresAt) - Date.now();
+    if (Number.isFinite(diffMs) && diffMs > 0) {
+      const totalHours = Math.ceil(diffMs / (3600 * 1000));
+      const days = Math.floor(totalHours / 24);
+      const hours = totalHours % 24;
+      remainingText = days > 0 ? `${days}h ${hours}j` : `${hours}j`;
+    }
+  }
+
+  return { isVip: true, expiresAt, remainingText };
+}
+
+export async function isUserVip(userId, deps = {}) {
+  const info = await getUserVipInfo(userId, deps);
+  return info.isVip;
+}
+
+export async function setUserVip(
+  userId,
+  ttlSeconds = 3 * 86400,
+  meta = { tier: "vip_3d" },
+  deps = {}
+) {
+  const redisClient = deps.redis || redis;
+  const safeTtl = Math.max(60, Number(ttlSeconds) || 3 * 86400);
+  await redisClient.set(`vip:${userId}`, meta, { ex: safeTtl });
+}
+
+export async function clearUserVip(userId, deps = {}) {
+  const redisClient = deps.redis || redis;
+  await redisClient.del(`vip:${userId}`);
 }
 
 export async function runPeriodicDbSelfHeal(
