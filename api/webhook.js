@@ -17,13 +17,14 @@ import {
   safeDeleteMessage,
   extractMediaPayload,
   publishToChannel,
+  reportSystemError,
 } from "../src/lib/telegram.js";
 
 const CHANNEL_ID = process.env.MENFESS_CHANNEL_ID;
 const BOT_USERNAME = process.env.BOT_USERNAME || "";
 const DAILY_QUOTA = Number(process.env.DAILY_QUOTA || 3);
 const WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET || "";
-const KEEP_DAYS = Number(process.env.DB_KEEP_DAYS || 10);
+const KEEP_DAYS = Number(process.env.DB_KEEP_DAYS || 30);
 const PURGE_STATUSES = (process.env.DB_PURGE_STATUSES || "published,rejected")
   .split(",")
   .map((s) => s.trim())
@@ -74,7 +75,12 @@ async function handleCallback(cq) {
 
   const [isUnique] = await Promise.all([
     claimEventOnce(`cq:${cqId}`, 120),
-    tgCall("answerCallbackQuery", { callback_query_id: cqId }).catch(() => null),
+    tgCall("answerCallbackQuery", { callback_query_id: cqId }).catch((e) => {
+      reportSystemError("answer_callback_query", e, `userId=${userId}`).catch(
+        () => null
+      );
+      return null;
+    }),
   ]);
 
   if (!isUnique) return;
@@ -84,7 +90,9 @@ async function handleCallback(cq) {
     await Promise.all([
       clearSession(userId),
       safeDeleteMessage(chatId, msgId),
-      safeDeleteMessage(chatId, prevSess?.pm),
+      prevSess?.pm && prevSess.pm !== msgId
+        ? safeDeleteMessage(chatId, prevSess.pm)
+        : Promise.resolve(false),
     ]);
     await tgCall("sendMessage", {
       chat_id: chatId,
@@ -147,10 +155,14 @@ async function handleCallback(cq) {
     if (!sess || sess.s !== "PICK_CAT" || !chosenCat || !sess.m) {
       await Promise.all([
         safeDeleteMessage(chatId, msgId),
+        sess?.pm && sess.pm !== msgId
+          ? safeDeleteMessage(chatId, sess.pm)
+          : Promise.resolve(false),
         tgCall("sendMessage", {
           chat_id: chatId,
           text: "Sesi sudah berakhir atau tidak valid. Mulai lagi dengan /start.",
           parse_mode: "HTML",
+          reply_markup: mainMenuMarkup(),
         }),
       ]);
       return;
@@ -174,7 +186,9 @@ async function handleCallback(cq) {
       await Promise.all([
         clearSession(userId),
         safeDeleteMessage(chatId, msgId),
-        safeDeleteMessage(chatId, sess.pm),
+        sess.pm && sess.pm !== msgId
+          ? safeDeleteMessage(chatId, sess.pm)
+          : Promise.resolve(false),
       ]);
       await tgCall("sendMessage", {
         chat_id: chatId,
@@ -222,35 +236,67 @@ async function handleCallback(cq) {
         botUsername: BOT_USERNAME,
       });
 
-      await Promise.all([
-        supabase.rpc("set_menfess_channel_msg", {
+      const { error: updateMsgErr } = await supabase.rpc(
+        "set_menfess_channel_msg",
+        {
           p_post_id: createdRow.id,
           p_channel_msg_id: sentChannelMsg.message_id,
           p_status: "published",
-        }),
+        }
+      );
+
+      if (updateMsgErr) {
+        reportSystemError(
+          "set_menfess_channel_msg",
+          updateMsgErr.message,
+          `postId=${createdRow.id} chMsgId=${sentChannelMsg.message_id}`
+        ).catch(() => null);
+      }
+
+      await Promise.all([
         clearSession(userId),
         safeDeleteMessage(chatId, msgId),
-        safeDeleteMessage(chatId, sess.pm),
+        sess.pm && sess.pm !== msgId
+          ? safeDeleteMessage(chatId, sess.pm)
+          : Promise.resolve(false),
       ]);
 
       const safeCat = escapeHtml(chosenCat.label);
       const safeCode = Math.max(0, Number(createdRow.public_code) || 0);
+      const sisaKuota = Math.max(0, quota.limit - quota.used);
 
       await tgCall("sendMessage", {
         chat_id: chatId,
         text:
-          `✅ Menfess <b>#${safeCode}</b> (<b>#${safeCat}</b>) berhasil tayang di channel!\n` +
-          `Sisa kuota hari ini: <b>${Math.max(0, quota.limit - quota.used)}/${quota.limit}</b>`,
+          `✅ <b>Menfess #${safeCode}</b> terkirim ke kategori <b>#${safeCat}</b>.\n` +
+          `💬 Balasan &amp; diskusi tersedia di kolom komentar channel.\n` +
+          `🎟 Sisa kuota hari ini: <b>${sisaKuota}/${quota.limit}</b>`,
         parse_mode: "HTML",
+        disable_web_page_preview: true,
         reply_markup: mainMenuMarkup(),
       });
     } catch (err) {
-      console.error("Publish menfess error:", err?.message || err);
+      console.error("[MFS] Publish menfess error:", err?.message || err);
+
       await Promise.all([
-        refundDailyQuota(userId).catch(() => null),
+        refundDailyQuota(userId).catch((refErr) => {
+          reportSystemError(
+            "refund_daily_quota",
+            refErr,
+            `userId=${userId}`
+          ).catch(() => null);
+          return null;
+        }),
         clearSession(userId).catch(() => null),
         safeDeleteMessage(chatId, msgId),
-        safeDeleteMessage(chatId, sess.pm),
+        sess.pm && sess.pm !== msgId
+          ? safeDeleteMessage(chatId, sess.pm)
+          : Promise.resolve(false),
+        reportSystemError(
+          "publish_menfess",
+          err,
+          `userId=${userId} kind=${sess.k} cat=${chosenCat.slug}`
+        ).catch(() => null),
       ]);
 
       await tgCall("sendMessage", {
@@ -411,7 +457,8 @@ export default async function handler(req, res) {
 
     return res.status(200).json({ ok: true });
   } catch (err) {
-    console.error("Webhook fatal guard:", err?.message || err);
+    console.error("[MFS] Webhook fatal guard:", err?.message || err);
+    await reportSystemError("webhook_fatal", err).catch(() => null);
     return res.status(200).json({ ok: true });
   }
 }
