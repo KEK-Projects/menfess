@@ -120,6 +120,45 @@ export async function reportSystemError(
   }
 }
 
+export async function reportAdminAudit(action, details = "", deps = {}) {
+  const tgCaller = deps.tgCall || tgCall;
+  const logChannelId =
+    deps.logChannelId ||
+    process.env.ADMIN_LOG_CHANNEL_ID ||
+    DEFAULT_ADMIN_LOG_CHANNEL;
+
+  const timeWib =
+    new Date(Date.now() + 7 * 3600 * 1000)
+      .toISOString()
+      .replace("T", " ")
+      .slice(0, 19) + " WIB";
+
+  const lines = [
+    `⭐ <b>[MFS]</b> <b>Admin VIP Audit</b>`,
+    `<b>Action:</b> <code>${escapeHtml(truncateText(String(action || "vip"), 80))}</code>`,
+    `<b>Time:</b> <code>${escapeHtml(timeWib)}</code>`,
+  ];
+
+  if (details) {
+    lines.push(
+      `<b>Detail:</b> <code>${escapeHtml(truncateText(String(details), 500))}</code>`
+    );
+  }
+
+  try {
+    await tgCaller("sendMessage", {
+      chat_id: logChannelId,
+      text: lines.join("\n"),
+      parse_mode: "HTML",
+      disable_web_page_preview: true,
+    });
+    return true;
+  } catch (err) {
+    console.error("[MFS] Failed to send admin audit log:", err?.message || err);
+    return false;
+  }
+}
+
 export function extractMediaPayload(msg) {
   if (!msg || typeof msg !== "object") return null;
 
@@ -188,7 +227,7 @@ export function buildChannelHtml({
     typeof botUsername === "string" ? botUsername.replace(/^@/, "").trim() : "";
   const safeBot = escapeHtml(cleanBot);
   const footer = safeBot
-    ? `\n\n<i>Kirim menfess lewat @${safeBot} · Komentar di bawah</i>`
+    ? `\n\n<i>Kirim lewat @${safeBot} · Komentar di bawah</i>`
     : `\n\n<i>Komentar di bawah</i>`;
 
   if (kind === "text") {
